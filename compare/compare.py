@@ -3,6 +3,7 @@ import os
 import sys
 import argparse
 import shutil
+import multiprocessing
 
 import asyncio
 from asyncio import StreamReader
@@ -29,6 +30,32 @@ PYTHON_FILE_DIR = Path(os.path.dirname(os.path.realpath(__file__)))
 TEMPLATES_DIR = PYTHON_FILE_DIR.joinpath('./.templates')
 PROJECTS_DIR = WORKDIR.joinpath('./compare-projects')
 CONFIG_TEMPLATE_PATH = TEMPLATES_DIR.joinpath('config-template.json')
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Compare logic here:
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+def first_mismatch_index(str1: str, str2: str) -> int:
+    for i in range(max(len(str1), len(str2))):
+        if i >= len(str1) or i >= len(str2):
+            return i
+        if str1[i] != str2[i]:
+            return i
+    return -1
+
+def compare(filename1: str, filename2: str) -> Tuple[bool, str]:
+    linenumber = 0
+    with open(filename1, 'r') as f1, open(filename2, 'r') as f2:
+        while True:
+            linenumber += 1
+            line1 = f1.readline()
+            line2 = f2.readline()
+            if line1 == '' and line2 == '':
+                return True, ''
+            elif line1 == '' or line2 == '':
+                return False, f'Unexpected end of file in line {linenumber} in file {filename1 if line1 == '' else filename2}'
+            if line1 != line2:
+                return False, f'Mismatch in line {linenumber} and column {first_mismatch_index(line1, line2) + 1}'
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Runner logic here:
@@ -187,6 +214,19 @@ def run_project(name):
             'in_b'
         )
     ]))
+    
+    with multiprocessing.Pool() as pool:
+        compare_process = pool.apply_async(compare, args=('in_a', 'in_b',))
+        result, verbose = compare_process.get()
+
+    if result:
+        print('Files are the same')
+    else:
+        print('Files differ')
+        print(verbose)
+        
+
+
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
