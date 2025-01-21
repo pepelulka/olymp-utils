@@ -1,190 +1,15 @@
+#!/usr/bin/python
 import json
-import os
-import sys
 import argparse
 import shutil
-import multiprocessing
 
 import asyncio
-from asyncio import StreamReader
-import subprocess
 
-from dataclasses import dataclass
-
-from pathlib import Path
-
-from enum import Enum
-
-from jsonschema import validate
-
-from typing import List, Tuple, Any
-
-ACTION_LIST = [
-    'create',
-    'run'
-]
-
-WORKDIR = Path.cwd()
-PYTHON_FILE_DIR = Path(os.path.dirname(os.path.realpath(__file__)))
-
-TEMPLATES_DIR = PYTHON_FILE_DIR.joinpath('./.templates')
-PROJECTS_DIR = WORKDIR.joinpath('./compare-projects')
-CONFIG_TEMPLATE_PATH = TEMPLATES_DIR.joinpath('config-template.json')
-
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-# Compare logic here:
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-
-def first_mismatch_index(str1: str, str2: str) -> int:
-    for i in range(max(len(str1), len(str2))):
-        if i >= len(str1) or i >= len(str2):
-            return i
-        if str1[i] != str2[i]:
-            return i
-    return -1
-
-def compare(filename1: str, filename2: str) -> Tuple[bool, str]:
-    linenumber = 0
-    with open(filename1, 'r') as f1, open(filename2, 'r') as f2:
-        while True:
-            linenumber += 1
-            line1 = f1.readline()
-            line2 = f2.readline()
-            if line1 == '' and line2 == '':
-                return True, ''
-            elif line1 == '' or line2 == '':
-                return False, f'Unexpected end of file in line {linenumber} in file {filename1 if line1 == '' else filename2}'
-            if line1 != line2:
-                return False, f'Mismatch in line {linenumber} and column {first_mismatch_index(line1, line2) + 1}'
-
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-# Runner logic here:
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-
-@dataclass
-class Program:
-    path: Path
-    type: str
-
-# `output` must support write function for text
-# Constantly forwarding data from async stream reader to output stream 
-async def forward_from_stream(stream: StreamReader, output):
-    BUF_SIZE = 1024
-    while True:
-        content = await stream.read(BUF_SIZE)
-        if len(content) == 0:
-            return
-        output.write(content)
-
-async def exec_program_async(p: Program, args: List[str] = ()):
-    if p.type == 'binary':
-        return await asyncio.create_subprocess_exec(p.path, *args, stdout=asyncio.subprocess.PIPE)
-    elif p.type == 'python':
-        return await asyncio.create_subprocess_exec('python', p.path, *args, stdout=asyncio.subprocess.PIPE)
-    return AssertionError(f'undefined type of program: {p.type}')
-
-
-async def run_programs(programs_and_out_files: List[Tuple[Program, Path]]):
-    cnt = len(programs_and_out_files)
-    processes = []
-    files = []
-    tasks = []
-    # Init
-    for program, filename in programs_and_out_files:
-        processes.append(await exec_program_async(program))
-        files.append(open(filename, 'wb'))
-        tasks.append(asyncio.create_task(forward_from_stream(processes[-1].stdout, files[-1])))
-    # Waiting
-    for i in range(cnt):
-        await processes[i].wait()
-        await tasks[i]
-        files[i].close()
-
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-# Core logic here:
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-
-SUPPORTED_EXEC_TYPES = [
-    'binary',
-    'python'
-]
-
-DEFAULT_EXEC_TYPE = 'binary'
-
-SUPPORTED_GENERATOR_TYPES = [
-    'serial'
-]
-
-DEFAULT_GENERATOR_TYPE = 'serial'
-
-CONFIG_SCHEMA = {
-    'type': 'object',
-    'properties': {
-        'program1': {'$ref': '#/$defs/program'},
-        'program2': {'$ref': '#/$defs/program'},
-        'generators': {
-            'type': 'array',
-            'items': {
-                '$ref': '#/$defs/generator'
-            }
-        },
-        'required': ['program1', 'program2', 'generators']
-    },
-    '$defs': {
-        'program': {
-            'type': 'object',
-            'properties': {
-                'path': {'type': 'string'},
-                'type': {'enum': SUPPORTED_EXEC_TYPES} 
-            },
-            'required': ['path']
-        },
-        'generator': {
-            'type': 'object',
-            'properties': {
-                'type': {'enum': SUPPORTED_GENERATOR_TYPES},
-                'name': {'type': 'string'},
-                'program': {'$ref': '#/$defs/program'},
-                'generator_config': {'type': 'object'}
-            },
-            'required': ['name', 'program']
-        }
-    }
-}
-
-@dataclass
-class Generator:
-    name: str
-    type: str
-    program: Program
-    generator_config: Any
-
-class Config:
-    def __init__(self, config_obj):
-        def value_from_dict_or_default(name: str, dictionary: Any, default_value: Any):
-            if name not in dictionary.keys():
-                return default_value
-            return dictionary[name]
-        
-        def extract_program(obj):
-            return Program(
-                obj['path'],
-                value_from_dict_or_default('type', obj, DEFAULT_EXEC_TYPE)
-            )
-        
-        def extract_generator(obj):
-            return Generator(
-                obj['name'],
-                value_from_dict_or_default('type', obj, DEFAULT_GENERATOR_TYPE),
-                extract_program(obj['program']),
-                value_from_dict_or_default('generator_config', obj, {})
-            )
-
-        # Extract info from json to python classes
-        self.program1 = extract_program(config_obj['program1'])
-        self.program2 = extract_program(config_obj['program2'])
-        self.generators = [extract_generator(generator) for generator in self.generators]
-
+from settings import *
+from utils import *
+from program import Program
+from generator import Generator
+from core import run_generator, Config
 
 # It doesn't check for project existance
 def create_project(name):
@@ -196,59 +21,89 @@ def create_project(name):
     project_config.touch()
     shutil.copy(CONFIG_TEMPLATE_PATH, project_config)
 
+def create_generator(name, gen_name, gen_type):
+    project_dir = PROJECTS_DIR.joinpath(name)
+    # Create generators directory
+    generators_dir = project_dir.joinpath('generators')
+    generators_dir.mkdir(exist_ok=True, parents=True)
+    # Create template for config
+    generator_exec_file = generators_dir.joinpath(f'{gen_name}.py')
+    gen_config = {'count': 100}
+    # TODO: Refactor
+    match gen_type:
+        case 'serial':
+            shutil.copy(SERIAL_GENERATOR_TEMPLATE_PATH, generator_exec_file)
+        case 'kd':
+            shutil.copy(KD_GENERATOR_TEMPLATE_PATH, generator_exec_file)
+        case _:
+            fail(f"Undefined generator type {gen_type}")
+    # Edit config
+    project_config = project_dir.joinpath('config.json')
+    with open(project_config, 'r') as cfg_file:
+        obj = json.load(cfg_file)
+    config = Config(obj)
+    new_generator = Generator(
+        gen_name,
+        gen_type,
+        Program(
+            f'generators/{gen_name}.py',
+            'python'
+        ),
+        gen_config
+    )
+    config.push_generator(new_generator)
+    with open(project_config, 'w') as cfg_file:
+        config.json_dump(cfg_file)
+
 
 def run_project(name):
-    asyncio.run(run_programs([
-        (
-            Program(
-                Path("./a.py"),
-                'python'
-            ),
-            'in_a'
-        ),
-        (
-            Program(
-                Path("./b.py"),
-                'python'
-            ),
-            'in_b'
-        )
-    ]))
-    
-    with multiprocessing.Pool() as pool:
-        compare_process = pool.apply_async(compare, args=('in_a', 'in_b',))
-        result, verbose = compare_process.get()
-
-    if result:
-        print('Files are the same')
-    else:
-        print('Files differ')
-        print(verbose)
-        
-
-
-
-
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-# Scripts logic here:
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-
-def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
+    project_dir = PROJECTS_DIR.joinpath(name)
+    project_config = project_dir.joinpath('config.json')
+    with open(project_config, 'r') as cfg_file:
+        obj = json.load(cfg_file)
+    config = Config(obj, path_prefix=project_dir)
+    for generator in config.generators:
+        print(f'Running generator {generator.name}...')
+        asyncio.run(run_generator(
+            config.program1,
+            config.program2,
+            generator,
+            project_dir.joinpath('.compare-buf'),
+            project_dir.joinpath('out')
+        ))
+        print(f'Generator {generator.name} finished!')
 
 def command_create_project(name):
     project_dir = PROJECTS_DIR.joinpath(name)
     if project_dir.exists():
-        eprint(f"Error: project {name} already exists!")
-        sys.exit(1)
+        fail(f"project {name} already exists!")
     create_project(name)
 
 def command_run_project(name):
     project_dir = PROJECTS_DIR.joinpath(name)
     if not project_dir.exists():
-        eprint(f"Error: project {name} doesn't exist!")
-        sys.exit(1)
+        fail(f"project {name} doesn't exist!")
     run_project(name)
+
+# example:
+# compare.py create-generator <project-name> <generator-name> [generator-type]
+def command_create_generator(name, args):
+    project_dir = PROJECTS_DIR.joinpath(name)
+    if not project_dir.exists():
+        fail(f"project {name} doesn't exist!")
+    
+    if len(args) == 0:
+        fail("You must specify generator name!")
+    
+    if len(args) == 1:
+        gen_type = DEFAULT_GENERATOR_TYPE
+        warning(f"generator type was not specified, using default generator type: {DEFAULT_GENERATOR_TYPE}")
+    else:
+        gen_type = args[1]
+        if gen_type not in SUPPORTED_GENERATOR_TYPES_SHORT_NAMES:
+            fail(f"{args[1]} generator type is not supported. List of supported generator types: {", ".join(SUPPORTED_GENERATOR_TYPES_SHORT_NAMES)}")
+    
+    create_generator(name, args[0], gen_type)
 
 
 def parse_args():
@@ -262,6 +117,7 @@ def parse_args():
         choices=ACTION_LIST
     )
     parser.add_argument("name", type=str)
+    parser.add_argument("args", nargs="*")
 
     return parser.parse_args()
 
@@ -271,6 +127,8 @@ def main():
         command_create_project(args.name)
     elif args.action == 'run':
         command_run_project(args.name)
+    elif args.action == 'create-generator':
+        command_create_generator(args.name, args.args)
 
 if __name__ == "__main__":
     main()
